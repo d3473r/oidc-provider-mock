@@ -84,6 +84,17 @@ _default_config = Config
     multiple=True,
     type=str,
 )
+@click.option(
+    "--issuer",
+    help='The issuer URL for the OpenID Connect Provider',
+    default="http://localhost:9400",
+    type=str,
+)
+@click.option(
+    "--proxy-fix",
+    help='Enable proxy fix',
+    is_flag=True,
+)
 def run(
     port: int,
     host: str,
@@ -94,6 +105,8 @@ def run(
     token_max_age: int,
     users: tuple[str, ...],
     user_claims_json: tuple[str, ...],
+    issuer: str,
+    proxy_fix: bool,
 ):
     """Start an OpenID Connect Provider for testing"""
 
@@ -128,7 +141,7 @@ def run(
         )
     )
     logging.getLogger().addHandler(handler)
-    logging.getLogger().setLevel(logging.INFO)
+    logging.getLogger().setLevel(logging.DEBUG)
 
     uvicorn.run(
         app(
@@ -137,6 +150,8 @@ def run(
             issue_refresh_token=not no_refresh_token,
             access_token_max_age=timedelta(seconds=token_max_age),
             user_claims=user_claims_list,
+            issuer=issuer,
+            proxy_fix=proxy_fix,
         ),
         interface="wsgi",
         port=port,

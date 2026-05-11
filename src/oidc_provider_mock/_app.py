@@ -25,6 +25,9 @@ from authlib import jose
 from authlib.integrations import flask_oauth2
 from authlib.integrations.flask_oauth2.requests import FlaskOAuth2Request
 from authlib.oauth2 import OAuth2Error, OAuth2Request
+from authlib.oauth2.rfc7636 import CodeChallenge
+from authlib.oauth2.rfc9068 import JWTBearerTokenGenerator
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 from . import _client
 from ._storage import (
@@ -54,8 +57,19 @@ class TokenValidator(authlib.oauth2.rfc6750.BearerTokenValidator):
 
         return token
 
+class MyJWTBearerTokenGenerator(JWTBearerTokenGenerator):
+    @override
+    def get_jwks(self):
+        return storage.jwk
+
+    @override
+    def get_extra_claims(self, client, grant_type, user, scope):
+        return _user_claims_for_scope(user, scope)
+
+
 
 class AuthorizationCodeGrant(authlib.oauth2.rfc6749.AuthorizationCodeGrant):
+    TOKEN_ENDPOINT_AUTH_METHODS = ['none', 'client_secret_basic', 'client_secret_post']
     @override
     def query_authorization_code(  # pyright: ignore[reportIncompatibleMethodOverride]
         self, code: str, client: Client
@@ -77,6 +91,8 @@ class AuthorizationCodeGrant(authlib.oauth2.rfc6749.AuthorizationCodeGrant):
         assert isinstance(request, OAuth2Request)
         assert isinstance(request.user, User)
         client = cast("Client", request.client)
+        code_challenge = request.payload.data.get('code_challenge')
+        code_challenge_method = request.payload.data.get('code_challenge_method')
         with warnings.catch_warnings():
             # Silence warnings for deprecated `OAuth2Request` properties.
             warnings.simplefilter("ignore", authlib.deprecate.AuthlibDeprecationWarning)
@@ -89,6 +105,8 @@ class AuthorizationCodeGrant(authlib.oauth2.rfc6749.AuthorizationCodeGrant):
                     redirect_uri=request.redirect_uri,  # pyright: ignore[reportDeprecated]
                     scope=request.scope,  # pyright: ignore[reportDeprecated]
                     nonce=request.data.get("nonce"),  # pyright: ignore[reportDeprecated]
+                    code_challenge=code_challenge,
+                    code_challenge_method=code_challenge_method,
                 )
             )
 
@@ -205,6 +223,7 @@ class Config:
     issue_refresh_token: bool = True
     access_token_max_age: timedelta = timedelta(hours=1)
     user_claims: Sequence[User] = ()
+    issuer: str
 
 
 @blueprint.record
@@ -287,13 +306,21 @@ def setup(setup_state: flask.blueprints.BlueprintSetupState):
         save_token=save_token,
     )
 
+    authorization.register_token_generator(
+        "default",
+        MyJWTBearerTokenGenerator(
+            issuer=config.issuer
+        ),
+    )
+
     authorization.register_grant(
         AuthorizationCodeGrant,
         [
             OpenIDCode(
                 require_nonce=config.require_nonce,
                 token_max_age=config.access_token_max_age,
-            )
+            ),
+            CodeChallenge(required=True)
         ],
     )
 
@@ -312,6 +339,8 @@ def app(
     issue_refresh_token: bool = True,
     access_token_max_age: timedelta = timedelta(hours=1),
     user_claims: Sequence[User] = (),
+    issuer: str,
+    proxy_fix: bool,
 ) -> flask.Flask:
     """Create a Flask app running the OpenID provider.
 
@@ -328,6 +357,8 @@ def app(
         issue_refresh_token=issue_refresh_token,
         access_token_max_age=access_token_max_age,
         user_claims=user_claims,
+        issuer=issuer,
+        proxy_fix=proxy_fix,
     )
     app.secret_key = secrets.token_bytes(16)
     if isinstance(app.json, flask.json.provider.DefaultJSONProvider):
@@ -344,6 +375,8 @@ def init_app(
     issue_refresh_token: bool = True,
     access_token_max_age: timedelta = timedelta(hours=1),
     user_claims: Sequence[User] = (),
+    issuer: str,
+    proxy_fix: bool,
 ):
     """Add the OpenID provider and its endpoints to the flask ``app``.
 
@@ -370,6 +403,7 @@ def init_app(
             issue_refresh_token=issue_refresh_token,
             access_token_max_age=access_token_max_age,
             user_claims=user_claims,
+            issuer=issuer
         ),
     )
 
@@ -378,6 +412,12 @@ def init_app(
     app.debug = True
     app.wsgi_app = werkzeug.debug.DebuggedApplication(app.wsgi_app)
     app.wsgi_app.trusted_hosts.append("localhost")
+
+    if proxy_fix:
+        _logger.debug("Proxy fix enabled")
+        app.wsgi_app = ProxyFix(
+            app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1
+        )
 
     return app
 
