@@ -63,6 +63,29 @@ def test_openid_configuration_uses_forwarded_headers(
     )
 
 
+def test_openid_configuration_uses_forwarded_prefix(
+    client: flask.testing.FlaskClient,
+):
+    response = client.get(
+        "/.well-known/openid-configuration",
+        headers={
+            "X-Forwarded-Proto": "https",
+            "X-Forwarded-Host": "provider.example.com",
+            "X-Forwarded-Prefix": "/prefix",
+        },
+    )
+
+    assert response.json
+    assert (
+        response.json["authorization_endpoint"]
+        == "https://provider.example.com/prefix/oauth2/authorize"
+    )
+    assert (
+        response.json["token_endpoint"]
+        == "https://provider.example.com/prefix/oauth2/token"
+    )
+
+
 def test_userinfo_unauthorized(client: flask.testing.FlaskClient):
     response = client.get("/userinfo")
     assert response.status_code == HTTPStatus.UNAUTHORIZED

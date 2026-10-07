@@ -510,7 +510,7 @@ def init_app(
     app.register_blueprint(_client.blueprint)
 
     app.debug = True
-    app.wsgi_app = ProxyFix(app.wsgi_app, x_host=1, x_proto=1, x_port=1)
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_host=1, x_proto=1, x_port=1, x_prefix=1)
 
     return app
 
