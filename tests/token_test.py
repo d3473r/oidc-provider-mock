@@ -1,4 +1,6 @@
+import json
 from datetime import timedelta
+from http import HTTPStatus
 
 import flask.testing
 import httpx2
@@ -149,3 +151,43 @@ def _authorize_and_fetch_token(client: OidcClient, sub: str | None = None) -> To
     )
     assert response.status_code == 302
     return client.fetch_token(response.headers["location"], state=state)
+
+
+def test_client_credentials_grant(oidc_server: str):
+    client = fake_client(oidc_server, auth_method="client_secret_post")
+    email = faker.email()
+
+    # Seed a user with the same subject as the client ID. Its claims are
+    # included in the issued token.
+    response = httpx2.put(f"{oidc_server}/users/{client.id}", json={"email": email})
+    assert response.status_code == HTTPStatus.NO_CONTENT
+
+    response = httpx2.post(
+        f"{oidc_server}/oauth2/token",
+        data={
+            "grant_type": "client_credentials",
+            "client_id": client.id,
+            "client_secret": client.secret,
+            "scope": "openid email",
+        },
+    )
+    assert response.status_code == HTTPStatus.OK
+    body = response.json()
+    assert body["token_type"] == "Bearer"
+    assert "refresh_token" not in body
+
+    claims = json.loads(
+        joserfc.jws.extract_compact(body["access_token"].encode()).payload
+    )
+    assert claims["iss"] == oidc_server.rstrip("/")
+    assert claims["sub"] == client.id
+    assert claims["client_id"] == client.id
+    assert claims["email"] == email
+
+    # The access token grants access to the userinfo endpoint
+    userinfo = httpx2.get(
+        f"{oidc_server}/userinfo",
+        headers={"Authorization": f"Bearer {body['access_token']}"},
+    )
+    assert userinfo.status_code == HTTPStatus.OK
+    assert userinfo.json()["sub"] == client.id

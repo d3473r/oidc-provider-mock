@@ -35,6 +35,7 @@ class Client(authlib.oauth2.rfc6749.ClientMixin):
     GRANT_TYPES_SUPPORTED: ClassVar[tuple[str, ...]] = (
         "authorization_code",
         "refresh_token",
+        "client_credentials",
     )
     SCOPES_SUPPORTED: ClassVar[tuple[str, ...]] = (
         "openid",

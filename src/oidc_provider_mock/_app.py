@@ -217,9 +217,8 @@ class RefreshTokenGrant(authlib.oauth2.rfc6749.RefreshTokenGrant):
 class ClientCredentialsGrant(authlib.oauth2.rfc6749.grants.ClientCredentialsGrant):
     """Client credentials grant.
 
-    If a user with the same subject as the client ID exists, the token is
-    issued for that user. This way the access token contains the claims of
-    that user.
+    The token is issued for the user with the same subject as the client ID.
+    This way the access token contains the claims of that user.
     """
 
     #: Allow authentication with ``client_secret_post`` in addition to HTTP
@@ -233,6 +232,7 @@ class ClientCredentialsGrant(authlib.oauth2.rfc6749.grants.ClientCredentialsGran
             warnings.simplefilter("ignore", authlib.deprecate.AuthlibDeprecationWarning)
             client_id = self.request.client_id  # pyright: ignore[reportDeprecated]
         user = storage.get_user(client_id)
+        self.request.user = user
         token = self.generate_token(  # pyright: ignore[reportUnknownMemberType]
             user=user,
             scope=self.request.scope,  # pyright: ignore[reportDeprecated]
@@ -724,7 +724,9 @@ def issue_token() -> flask.typing.ResponseReturnValue:
         )
         return authorization.handle_error_response(request, error)  # type: ignore
 
-    assert isinstance(grant, AuthorizationCodeGrant | RefreshTokenGrant)
+    assert isinstance(
+        grant, AuthorizationCodeGrant | RefreshTokenGrant | ClientCredentialsGrant
+    )
 
     try:
         grant.validate_token_request()
