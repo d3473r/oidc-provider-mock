@@ -104,6 +104,9 @@ class User:
     #: response.
     claims: dict[str, object] = field(default_factory=dict[str, object])
 
+    def get_user_id(self) -> str:
+        return self.sub
+
 
 @dataclass(kw_only=True, frozen=True)
 class AuthorizationCode(authlib.oidc.core.AuthorizationCodeMixin):
@@ -114,6 +117,8 @@ class AuthorizationCode(authlib.oidc.core.AuthorizationCodeMixin):
     scope: str
     nonce: str | None
     auth_time: int
+    code_challenge: str | None = None
+    code_challenge_method: str | None = None
 
     # Implement AuthorizationCodeMixin
 

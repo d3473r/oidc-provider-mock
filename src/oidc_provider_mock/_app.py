@@ -6,7 +6,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
-from typing import Never, cast, override
+from typing import TYPE_CHECKING, Never, cast, override
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 from uuid import uuid4
 
@@ -24,6 +24,9 @@ import werkzeug.local
 from authlib.integrations import flask_oauth2
 from authlib.integrations.flask_oauth2.requests import FlaskOAuth2Request
 from authlib.oauth2 import OAuth2Error, OAuth2Request
+from authlib.oauth2.rfc6750 import BearerTokenGenerator
+from authlib.oauth2.rfc7636 import CodeChallenge
+from authlib.oauth2.rfc9068 import JWTBearerTokenGenerator
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from . import _client
@@ -38,6 +41,9 @@ from ._storage import (
     User,
     storage,
 )
+
+if TYPE_CHECKING:
+    from authlib.oauth2.rfc6750.token import _TokenGenerator  # pyright: ignore[reportPrivateUsage]
 
 assert __package__
 _logger = logging.getLogger(__package__)
@@ -55,6 +61,46 @@ class TokenValidator(authlib.oauth2.rfc6750.BearerTokenValidator):
             raise authlib.oauth2.rfc6749.AccessDeniedError()
 
         return token
+
+
+class JWTAccessTokenGenerator(JWTBearerTokenGenerator):
+    """Issue access tokens as JWTs (RFC 9068) which include the user claims.
+
+    Like the ID tokens, the issuer is derived from the host of the current
+    request. This way it also works behind a reverse proxy with forwarded
+    headers.
+    """
+
+    def __init__(
+        self,
+        refresh_token_generator: "_TokenGenerator | None" = None,
+        expires_generator: "Callable[[authlib.oauth2.rfc6749.ClientMixin, str], int] | None" = None,
+    ) -> None:
+        # Bypass ``JWTBearerTokenGenerator.__init__``, which requires a
+        # static issuer. See the ``issuer`` property below.
+        BearerTokenGenerator.__init__(
+            self,
+            self.access_token_generator,  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
+            refresh_token_generator,
+            expires_generator,
+        )
+        self.alg = _JWS_ALG
+
+    @property
+    def issuer(self) -> str:
+        return flask.request.host_url.rstrip("/")
+
+    @override
+    def get_jwks(self) -> joserfc.jwk.RSAKey:
+        return storage.jwk
+
+    @override
+    def get_extra_claims(
+        self, client: object, grant_type: str, user: object, scope: str | None
+    ) -> dict[str, object]:
+        if not isinstance(user, User):
+            return {}
+        return _user_claims_for_scope(user, scope)
 
 
 class AuthorizationCodeGrant(authlib.oauth2.rfc6749.AuthorizationCodeGrant):
@@ -94,6 +140,8 @@ class AuthorizationCodeGrant(authlib.oauth2.rfc6749.AuthorizationCodeGrant):
                     scope=request.scope,  # pyright: ignore[reportDeprecated]
                     nonce=request.data.get("nonce"),  # pyright: ignore[reportDeprecated]
                     auth_time=int(datetime.now(UTC).timestamp()),
+                    code_challenge=request.data.get("code_challenge"),  # pyright: ignore[reportDeprecated]
+                    code_challenge_method=request.data.get("code_challenge_method"),  # pyright: ignore[reportDeprecated]
                 )
             )
 
@@ -166,8 +214,36 @@ class RefreshTokenGrant(authlib.oauth2.rfc6749.RefreshTokenGrant):
         storage.remove_access_token(refresh_token.access_token)
 
 
-def _user_claims_for_scope(user: User, scope: str) -> dict[str, object]:
-    scopes = scope.split(" ")
+class ClientCredentialsGrant(authlib.oauth2.rfc6749.grants.ClientCredentialsGrant):
+    """Client credentials grant.
+
+    If a user with the same subject as the client ID exists, the token is
+    issued for that user. This way the access token contains the claims of
+    that user.
+    """
+
+    #: Allow authentication with ``client_secret_post`` in addition to HTTP
+    #: Basic authentication.
+    TOKEN_ENDPOINT_AUTH_METHODS = ["client_secret_basic", "client_secret_post"]
+
+    @override
+    def create_token_response(self):
+        with warnings.catch_warnings():
+            # Silence warnings for deprecated `OAuth2Request` properties.
+            warnings.simplefilter("ignore", authlib.deprecate.AuthlibDeprecationWarning)
+            client_id = self.request.client_id  # pyright: ignore[reportDeprecated]
+        user = storage.get_user(client_id)
+        token = self.generate_token(  # pyright: ignore[reportUnknownMemberType]
+            user=user,
+            scope=self.request.scope,  # pyright: ignore[reportDeprecated]
+            include_refresh_token=False,
+        )
+        self.save_token(token)  # pyright: ignore[reportUnknownMemberType]
+        return 200, token, self.TOKEN_RESPONSE_HEADER
+
+
+def _user_claims_for_scope(user: User, scope: str | None) -> dict[str, object]:
+    scopes = (scope or "").split(" ")
     allowed_standard_claims_for_scope = {
         claim for scope in scopes for claim in _SCOPES_TO_CLAIMS.get(scope, [])
     }
@@ -321,16 +397,41 @@ def setup(setup_state: flask.blueprints.BlueprintSetupState):
         save_token=save_token,
     )
 
-    for grant in (AuthorizationCodeGrant, RefreshTokenGrant):
-        authorization.register_grant(
-            grant,
-            [
-                OpenIDCode(
-                    require_nonce=config.require_nonce,
-                    token_max_age=config.access_token_max_age,
-                )
-            ],
-        )
+    # Issue access tokens as JWTs (RFC 9068) instead of opaque tokens. Reuse
+    # the refresh token and expiry configuration of the default generator.
+    default_generator = authorization.create_bearer_token_generator(  # pyright: ignore[reportUnknownMemberType]
+        setup_state.app.config
+    )
+    authorization.register_token_generator(
+        "default",
+        JWTAccessTokenGenerator(
+            refresh_token_generator=default_generator.refresh_token_generator,
+            expires_generator=default_generator.expires_generator,
+        ),
+    )
+
+    authorization.register_grant(
+        AuthorizationCodeGrant,
+        [
+            OpenIDCode(
+                require_nonce=config.require_nonce,
+                token_max_age=config.access_token_max_age,
+            ),
+            CodeChallenge(required=False),
+        ],
+    )
+
+    authorization.register_grant(
+        RefreshTokenGrant,
+        [
+            OpenIDCode(
+                require_nonce=config.require_nonce,
+                token_max_age=config.access_token_max_age,
+            ),
+        ],
+    )
+
+    authorization.register_grant(ClientCredentialsGrant)
 
 
 @blueprint.record_once
